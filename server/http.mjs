@@ -2,7 +2,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 
-export function createHttpServer(config, sfu) {
+export function createHttpServer(config, sfu, voice) {
   const publicDir = join(config.rootDir, "public");
   const vendorFiles = new Map([
     ["/vendor/xterm.mjs", join(config.rootDir, "node_modules/@xterm/xterm/lib/xterm.mjs")],
@@ -15,8 +15,9 @@ export function createHttpServer(config, sfu) {
       res.writeHead(204, { "Access-Control-Allow-Methods": "OPTIONS, POST, DELETE", "Access-Control-Allow-Headers": "Content-Type" });
       return res.end();
     }
-    if (req.method === "GET" && url.pathname === "/health") return respond(res, 200, { ok: true, transport: "whip-mediasoup-datachannel", clients: sfu.clients(), projectDir: config.projectDir, opencodeCommand: config.opencodeCommand });
+    if (req.method === "GET" && url.pathname === "/health") return respond(res, 200, { ok: true, transport: "whip-mediasoup-datachannel", voiceConfigured: voice.configured(), clients: sfu.clients(), audioTracks: sfu.audioTracks(), projectDir: config.projectDir, opencodeCommand: config.opencodeCommand });
     if (req.method === "POST" && url.pathname === "/whip") return createWhipSession(req, res, sfu);
+    if (req.method === "POST" && url.pathname === "/voice/speak") return speak(req, res, voice);
     if (req.method === "DELETE" && url.pathname.startsWith("/whip/session/")) {
       sfu.closeSession(url.pathname.slice("/whip/session/".length));
       res.writeHead(204);
@@ -24,6 +25,29 @@ export function createHttpServer(config, sfu) {
     }
     await serveStatic(req, res, publicDir, vendorFiles);
   });
+}
+
+async function speak(req, res, voice) {
+  try {
+    const { text } = JSON.parse((await readBody(req, 100000)).toString("utf8"));
+    if (typeof text !== "string" || !text.trim()) throw new Error("Speech text is required.");
+    const audio = await voice.speak(text.slice(0, 4000));
+    res.writeHead(200, { "Content-Type": "audio/mpeg", "Cache-Control": "no-store" });
+    res.end(audio);
+  } catch (error) {
+    respond(res, 400, { error: error.message });
+  }
+}
+
+async function readBody(req, maxBytes) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > maxBytes) throw new Error("Request body is too large.");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 async function createWhipSession(req, res, sfu) {

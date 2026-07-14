@@ -3,6 +3,7 @@ import { FitAddon } from "/vendor/addon-fit.mjs";
 
 const container = document.querySelector("#terminal");
 const connectionEl = document.querySelector("#connection");
+const voiceButton = document.querySelector("#voice");
 const fitAddon = new FitAddon();
 const terminal = new Terminal({
   cursorBlink: true,
@@ -44,7 +45,33 @@ container.addEventListener("pointerdown", (event) => {
 });
 
 let inputDataChannel;
+let peerConnection;
 let resizeTimer;
+let isRecording = false;
+let pushToTalk = false;
+let microphoneStream;
+let microphoneTrack;
+let audioSender;
+let audioPublished = false;
+let audioPublishing = false;
+
+function beginPushToTalk() {
+  if (pushToTalk || isRecording) return;
+  pushToTalk = true;
+  startRecording().then(() => {
+    if (!pushToTalk && isRecording) stopRecording();
+  }).catch((error) => {
+    pushToTalk = false;
+    terminal.write(`\r\n\x1b[31mvoice-cli: ${error.message}\x1b[0m\r\n`);
+    resetVoiceButton();
+  });
+}
+
+function endPushToTalk() {
+  if (!pushToTalk) return;
+  pushToTalk = false;
+  if (isRecording) stopRecording();
+}
 
 function send(event) {
   if (inputDataChannel?.readyState === "open") inputDataChannel.send(JSON.stringify(event));
@@ -65,7 +92,7 @@ function waitForIceGathering(peerConnection) {
 }
 
 async function connect() {
-  const peerConnection = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+  peerConnection = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
   // DCEP opens the SCTP stream after the WHIP offer/answer exchange.
   inputDataChannel = peerConnection.createDataChannel("agent-control", { ordered: true });
   inputDataChannel.addEventListener("open", () => {
@@ -73,6 +100,7 @@ async function connect() {
     connectionEl.className = "connected hidden";
     fit();
     terminal.focus();
+    publishAudio();
   });
   inputDataChannel.addEventListener("close", () => {
     connectionEl.textContent = "disconnected · reload to reconnect";
@@ -81,6 +109,13 @@ async function connect() {
   inputDataChannel.addEventListener("message", (message) => handleEvent(JSON.parse(message.data)));
 
   try {
+    try {
+      microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      microphoneTrack = microphoneStream.getAudioTracks()[0];
+      audioSender = peerConnection.addTrack(microphoneTrack, microphoneStream);
+    } catch (error) {
+      terminal.write(`\r\n\x1b[90mvoice-cli: microphone is unavailable (${error.message})\x1b[0m\r\n`);
+    }
     await peerConnection.setLocalDescription(await peerConnection.createOffer());
     await waitForIceGathering(peerConnection);
     const response = await fetch("/whip", {
@@ -99,7 +134,35 @@ async function connect() {
   }
 }
 
+async function publishAudio() {
+  if (audioPublished || audioPublishing || !audioSender || !inputDataChannel || inputDataChannel.readyState !== "open") return;
+  audioPublishing = true;
+  try {
+    const transceiver = peerConnection.getTransceivers().find((item) => item.sender === audioSender);
+    const rtpParameters = audioSender.getParameters();
+    const stats = await audioSender.getStats();
+    const outbound = [...stats.values()].find((item) => item.type === "outbound-rtp" && item.kind === "audio" && item.ssrc);
+    if (!transceiver?.mid || !rtpParameters.codecs?.length || !outbound) {
+      setTimeout(publishAudio, 100);
+      return;
+    }
+    rtpParameters.encodings = rtpParameters.encodings.map((encoding) => ({ ...encoding, ssrc: outbound.ssrc }));
+    audioPublished = true;
+    send({ type: "audio.produce", payload: { rtpParameters: { ...rtpParameters, mid: transceiver.mid } } });
+  } catch {
+    setTimeout(publishAudio, 100);
+  } finally {
+    audioPublishing = false;
+  }
+}
+
 function handleEvent(event) {
+  if (event.type === "audio.ready" && microphoneTrack) microphoneTrack.enabled = false;
+  if (event.type === "audio.transcribing") {
+    voiceButton.disabled = true;
+    voiceButton.textContent = "Transcribing...";
+  }
+  if (event.type === "audio.transcribed") resetVoiceButton();
   if (event.type === "terminal.output") terminal.write(event.payload.data);
   if (event.type === "terminal.exit") {
     terminal.write(`\r\n\x1b[90m[OpenCode exited with code ${event.payload.exit_code}]\x1b[0m\r\n`);
@@ -110,10 +173,53 @@ function handleEvent(event) {
     terminal.write(`\r\n\x1b[31mvoice-cli: ${event.payload.message}\x1b[0m\r\n`);
     connectionEl.textContent = "error";
     connectionEl.className = "error";
+    resetVoiceButton();
   }
 }
 
+async function startRecording() {
+  if (!microphoneTrack) throw new Error("Microphone permission is required. Reload and allow microphone access.");
+  microphoneTrack.enabled = true;
+  isRecording = true;
+  send({ type: "audio.recording.start", payload: {} });
+  voiceButton.textContent = "Stop recording";
+  voiceButton.classList.add("recording");
+}
+
+function stopRecording() {
+  isRecording = false;
+  microphoneTrack.enabled = false;
+  send({ type: "audio.recording.stop", payload: {} });
+  voiceButton.textContent = "Stopping...";
+  voiceButton.classList.remove("recording");
+}
+
+function resetVoiceButton() {
+  voiceButton.disabled = false;
+  voiceButton.textContent = "Hold F8 to talk";
+}
+
 terminal.onData((data) => send({ type: "terminal.input", payload: { data } }));
+voiceButton.addEventListener("click", async () => {
+  try {
+    if (isRecording) stopRecording();
+    else await startRecording();
+  } catch (error) {
+    terminal.write(`\r\n\x1b[31mvoice-cli: ${error.message}\x1b[0m\r\n`);
+  }
+});
+window.addEventListener("keydown", (event) => {
+  if (event.code !== "F8" || event.repeat) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  beginPushToTalk();
+}, true);
+window.addEventListener("keyup", (event) => {
+  if (event.code !== "F8") return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  endPushToTalk();
+}, true);
 new ResizeObserver(() => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(fit, 40);

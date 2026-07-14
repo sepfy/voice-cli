@@ -45,3 +45,14 @@ Each browser connection creates a WHIP session and a dedicated mediasoup WebRTC 
 ## Network configuration
 
 By default, the HTTP server and mediasoup listen on `127.0.0.1`, so the example is local-only. For remote clients, set `MEDIASOUP_LISTEN_IP` to the server interface and `MEDIASOUP_ANNOUNCED_ADDRESS` to the public address, then permit the mediasoup UDP/TCP ports in your firewall. Add TURN before exposing this beyond a controlled network.
+
+## OpenAI voice
+
+Set an OpenAI API key before using the voice button:
+
+```bash
+export OPENAI_API_KEY="..."
+npm start
+```
+
+The browser negotiates an Opus audio track with the mediasoup SFU when it connects. The track is enabled only while recording. The local server bridges the SFU RTP stream through FFmpeg into an audio segment for OpenAI transcription, then injects the resulting text into the existing interactive OpenCode session. The CLI remains the single source of input and output. `OPENAI_TTS_MODEL` and `OPENAI_TTS_VOICE` are reserved for a future TTS bridge that can reliably identify completed TUI responses.

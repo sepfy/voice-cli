@@ -32,9 +32,7 @@ export function stopTerminal(session) {
 
 export function handleTerminalEvent(session, event, config, sendEvent) {
   if (event.type === "terminal.input") {
-    const input = event.payload?.data || "";
-    if (session.terminal) session.terminal.write(input);
-    else session.pendingInput.push(input);
+    writeTerminalInput(session, event.payload?.data || "");
     return;
   }
   if (event.type === "terminal.resize") {
@@ -43,8 +41,16 @@ export function handleTerminalEvent(session, event, config, sendEvent) {
     session.terminal?.resize(cols, rows);
     return;
   }
-  if (event.type === "user.message") runAgentLoop(session, event.payload?.text || "", config, sendEvent);
+  if (event.type === "user.message") {
+    // Voice transcripts enter the same interactive OpenCode session as keyboard input.
+    writeTerminalInput(session, `${event.payload?.text || ""}\r`);
+  }
   else sendEvent(session, { type: "error", payload: { message: `Unsupported DataChannel event: ${event.type}` } });
+}
+
+function writeTerminalInput(session, input) {
+  if (session.terminal) session.terminal.write(input);
+  else session.pendingInput.push(input);
 }
 
 async function runAgentLoop(session, text, config, sendEvent) {
