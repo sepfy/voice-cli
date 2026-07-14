@@ -1,15 +1,17 @@
 # Voice CLI
 
-A browser terminal frontend for the native OpenCode TUI.
+A browser terminal frontend for the native OpenCode TUI, connected through a mediasoup SFU.
 
 ```text
 Browser xterm.js
-  -> WebSocket
+  -> WHIP HTTP session setup
+  -> WebRTC SCTP DataChannel
+  -> mediasoup SFU
   -> node-pty
   -> native OpenCode TUI
 ```
 
-This intentionally avoids LiveKit/WHIP/SFU so the core protocol can be tested locally.
+The WHIP offer opens an SCTP DataChannel. A mediasoup DirectTransport terminates browser input in Node, while the same SFU DataChannel relays terminal output to the browser. HTTP is used only for WHIP session creation and teardown.
 
 ## Run
 
@@ -32,10 +34,14 @@ For development, `npm start` still starts the server directly for the current di
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 22 or newer
 - OpenCode installed and authenticated
-- A browser with WebSocket support
+- A browser with WebRTC DataChannel support
 
 ## How it works
 
-Each browser connection starts OpenCode in a dedicated pseudo-terminal. xterm.js forwards keyboard input and terminal dimensions over WebSocket, while `node-pty` sends OpenCode's native ANSI output back to the browser. The server listens on `127.0.0.1` only.
+Each browser connection creates a WHIP session and a dedicated mediasoup WebRTC transport with SCTP enabled. xterm.js forwards keyboard input and terminal dimensions through the `agent-control` DataChannel. Node terminates input with a DirectTransport, and `node-pty` sends OpenCode's native ANSI output back through the same channel.
+
+## Network configuration
+
+By default, the HTTP server and mediasoup listen on `127.0.0.1`, so the example is local-only. For remote clients, set `MEDIASOUP_LISTEN_IP` to the server interface and `MEDIASOUP_ANNOUNCED_ADDRESS` to the public address, then permit the mediasoup UDP/TCP ports in your firewall. Add TURN before exposing this beyond a controlled network.

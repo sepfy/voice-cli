@@ -10,9 +10,7 @@ const terminal = new Terminal({
   fontFamily: '"SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, monospace',
   fontSize: 13,
   lineHeight: 1.18,
-  letterSpacing: 0,
   scrollback: 10000,
-  allowTransparency: false,
   theme: {
     background: "#0a0a0a",
     foreground: "#d0d0d0",
@@ -40,51 +38,82 @@ const terminal = new Terminal({
 
 terminal.loadAddon(fitAddon);
 terminal.open(container);
+container.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  terminal.focus();
+});
 
-let ws;
+let inputDataChannel;
 let resizeTimer;
 
-function send(type, payload = {}) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, payload }));
+function send(event) {
+  if (inputDataChannel?.readyState === "open") inputDataChannel.send(JSON.stringify(event));
 }
 
 function fit() {
   fitAddon.fit();
-  send("terminal.resize", { cols: terminal.cols, rows: terminal.rows });
+  send({ type: "terminal.resize", payload: { cols: terminal.cols, rows: terminal.rows } });
 }
 
-function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+function waitForIceGathering(peerConnection) {
+  if (peerConnection.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    peerConnection.addEventListener("icegatheringstatechange", () => {
+      if (peerConnection.iceGatheringState === "complete") resolve();
+    });
+  });
+}
 
-  ws.addEventListener("open", () => {
+async function connect() {
+  const peerConnection = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+  // DCEP opens the SCTP stream after the WHIP offer/answer exchange.
+  inputDataChannel = peerConnection.createDataChannel("agent-control", { ordered: true });
+  inputDataChannel.addEventListener("open", () => {
     connectionEl.textContent = "connected";
     connectionEl.className = "connected hidden";
     fit();
     terminal.focus();
   });
-
-  ws.addEventListener("message", (message) => {
-    const event = JSON.parse(message.data);
-    if (event.type === "terminal.output") terminal.write(event.payload.data);
-    if (event.type === "terminal.exit") {
-      terminal.write(`\r\n\x1b[90m[OpenCode exited with code ${event.payload.exit_code}]\x1b[0m\r\n`);
-      connectionEl.textContent = "process exited";
-      connectionEl.className = "error";
-    }
-    if (event.type === "error") {
-      terminal.write(`\r\n\x1b[31mvoice-cli: ${event.payload.message}\x1b[0m\r\n`);
-      connectionEl.textContent = "error";
-      connectionEl.className = "error";
-    }
-  });
-
-  ws.addEventListener("close", () => {
+  inputDataChannel.addEventListener("close", () => {
     connectionEl.textContent = "disconnected · reload to reconnect";
     connectionEl.className = "error";
   });
+  inputDataChannel.addEventListener("message", (message) => handleEvent(JSON.parse(message.data)));
+
+  try {
+    await peerConnection.setLocalDescription(await peerConnection.createOffer());
+    await waitForIceGathering(peerConnection);
+    const response = await fetch("/whip", {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: peerConnection.localDescription.sdp
+    });
+    if (!response.ok) throw new Error(await response.text() || `WHIP request failed: ${response.status}`);
+    await peerConnection.setRemoteDescription({ type: "answer", sdp: await response.text() });
+    window.addEventListener("beforeunload", () => fetch(response.headers.get("Location"), { method: "DELETE", keepalive: true }));
+  } catch (error) {
+    connectionEl.textContent = "connection error";
+    connectionEl.className = "error";
+    terminal.write(`\r\n\x1b[31mvoice-cli: ${error.message}\x1b[0m\r\n`);
+    peerConnection.close();
+  }
 }
 
-terminal.onData((data) => send("terminal.input", { data }));
+function handleEvent(event) {
+  if (event.type === "terminal.output") terminal.write(event.payload.data);
+  if (event.type === "terminal.exit") {
+    terminal.write(`\r\n\x1b[90m[OpenCode exited with code ${event.payload.exit_code}]\x1b[0m\r\n`);
+    connectionEl.textContent = "process exited";
+    connectionEl.className = "error";
+  }
+  if (event.type === "error") {
+    terminal.write(`\r\n\x1b[31mvoice-cli: ${event.payload.message}\x1b[0m\r\n`);
+    connectionEl.textContent = "error";
+    connectionEl.className = "error";
+  }
+}
+
+terminal.onData((data) => send({ type: "terminal.input", payload: { data } }));
 new ResizeObserver(() => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(fit, 40);
