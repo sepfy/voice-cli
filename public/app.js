@@ -4,6 +4,7 @@ import { FitAddon } from "/vendor/addon-fit.mjs";
 const container = document.querySelector("#terminal");
 const connectionEl = document.querySelector("#connection");
 const voiceButton = document.querySelector("#voice");
+const toastEl = document.querySelector("#toast");
 const fitAddon = new FitAddon();
 const terminal = new Terminal({
   cursorBlink: true,
@@ -54,6 +55,14 @@ let microphoneTrack;
 let audioSender;
 let audioPublished = false;
 let audioPublishing = false;
+let toastTimer;
+
+function showToast(message) {
+  clearTimeout(toastTimer);
+  toastEl.textContent = message;
+  toastEl.hidden = false;
+  toastTimer = setTimeout(() => { toastEl.hidden = true; }, 6000);
+}
 
 function beginPushToTalk() {
   if (pushToTalk || isRecording) return;
@@ -62,7 +71,7 @@ function beginPushToTalk() {
     if (!pushToTalk && isRecording) stopRecording();
   }).catch((error) => {
     pushToTalk = false;
-    terminal.write(`\r\n\x1b[31mvoice-cli: ${error.message}\x1b[0m\r\n`);
+    showToast(error.message);
     resetVoiceButton();
   });
 }
@@ -114,7 +123,7 @@ async function connect() {
       microphoneTrack = microphoneStream.getAudioTracks()[0];
       audioSender = peerConnection.addTrack(microphoneTrack, microphoneStream);
     } catch (error) {
-      terminal.write(`\r\n\x1b[90mvoice-cli: microphone is unavailable (${error.message})\x1b[0m\r\n`);
+      showToast(`Microphone is unavailable: ${error.message}`);
     }
     await peerConnection.setLocalDescription(await peerConnection.createOffer());
     await waitForIceGathering(peerConnection);
@@ -129,7 +138,7 @@ async function connect() {
   } catch (error) {
     connectionEl.textContent = "connection error";
     connectionEl.className = "error";
-    terminal.write(`\r\n\x1b[31mvoice-cli: ${error.message}\x1b[0m\r\n`);
+    showToast(error.message);
     peerConnection.close();
   }
 }
@@ -170,7 +179,7 @@ function handleEvent(event) {
     connectionEl.className = "error";
   }
   if (event.type === "error") {
-    terminal.write(`\r\n\x1b[31mvoice-cli: ${event.payload.message}\x1b[0m\r\n`);
+    showToast(event.payload.message);
     connectionEl.textContent = "error";
     connectionEl.className = "error";
     resetVoiceButton();
@@ -205,7 +214,7 @@ voiceButton.addEventListener("click", async () => {
     if (isRecording) stopRecording();
     else await startRecording();
   } catch (error) {
-    terminal.write(`\r\n\x1b[31mvoice-cli: ${error.message}\x1b[0m\r\n`);
+    showToast(error.message);
   }
 });
 window.addEventListener("keydown", (event) => {
