@@ -1,167 +1,93 @@
-const statusEl = document.querySelector("#status");
-const messagesEl = document.querySelector("#messages");
-const form = document.querySelector("#composer");
-const input = document.querySelector("#input");
-const micBtn = document.querySelector("#micBtn");
+import { Terminal } from "/vendor/xterm.mjs";
+import { FitAddon } from "/vendor/addon-fit.mjs";
 
-let ws = null;
-let recorder = null;
-let micStream = null;
-let currentAgentMessage = null;
+const container = document.querySelector("#terminal");
+const connectionEl = document.querySelector("#connection");
+const fitAddon = new FitAddon();
+const terminal = new Terminal({
+  cursorBlink: true,
+  cursorStyle: "block",
+  fontFamily: '"SFMono-Regular", "Cascadia Code", "Roboto Mono", Consolas, monospace',
+  fontSize: 13,
+  lineHeight: 1.18,
+  letterSpacing: 0,
+  scrollback: 10000,
+  allowTransparency: false,
+  theme: {
+    background: "#0a0a0a",
+    foreground: "#d0d0d0",
+    cursor: "#f0f0f0",
+    cursorAccent: "#0a0a0a",
+    selectionBackground: "#3a3a3a99",
+    black: "#1b1b1b",
+    red: "#d96c75",
+    green: "#8ccf7e",
+    yellow: "#e5c07b",
+    blue: "#70a5eb",
+    magenta: "#c68aee",
+    cyan: "#74bee9",
+    white: "#d0d0d0",
+    brightBlack: "#666666",
+    brightRed: "#e8838f",
+    brightGreen: "#a7da93",
+    brightYellow: "#f0cf8e",
+    brightBlue: "#86b6f2",
+    brightMagenta: "#d4a0f3",
+    brightCyan: "#8ac8ee",
+    brightWhite: "#ffffff"
+  }
+});
 
-function addMessage(kind, text) {
-  const item = document.createElement("div");
-  item.className = `message ${kind}`;
-  item.textContent = text;
-  messagesEl.appendChild(item);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-  return item;
+terminal.loadAddon(fitAddon);
+terminal.open(container);
+
+let ws;
+let resizeTimer;
+
+function send(type, payload = {}) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, payload }));
 }
 
-function sendJson(type, payload = {}) {
-  ws?.send(JSON.stringify({ type, payload }));
+function fit() {
+  fitAddon.fit();
+  send("terminal.resize", { cols: terminal.cols, rows: terminal.rows });
 }
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
 
   ws.addEventListener("open", () => {
-    statusEl.textContent = "Connected";
+    connectionEl.textContent = "connected";
+    connectionEl.className = "connected hidden";
+    fit();
+    terminal.focus();
   });
 
-  ws.addEventListener("close", () => {
-    statusEl.textContent = "Disconnected";
-    setTimeout(connect, 1000);
-  });
-
-  ws.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    handleEvent(message);
-  });
-}
-
-function handleEvent(event) {
-  const { type, payload } = event;
-
-  if (type === "runtime.ready") {
-    statusEl.textContent = payload.stt_configured
-      ? `Connected. STT enabled. session=${payload.session_id}`
-      : `Connected. STT not configured. session=${payload.session_id}`;
-    addMessage("system", "Runtime is ready.");
-    return;
-  }
-
-  if (type === "agent.started") {
-    currentAgentMessage = addMessage("agent", "");
-    return;
-  }
-
-  if (type === "agent.delta") {
-    if (!currentAgentMessage) currentAgentMessage = addMessage("agent", "");
-    currentAgentMessage.textContent += payload.text;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    return;
-  }
-
-  if (type === "agent.done") {
-    currentAgentMessage = null;
-    return;
-  }
-
-  if (type === "agent.message") {
-    addMessage("agent", payload.text);
-    return;
-  }
-
-  if (type === "audio.started") {
-    addMessage("system", `Audio stream started: ${payload.mime_type}`);
-    return;
-  }
-
-  if (type === "audio.progress") {
-    statusEl.textContent = `Recording: ${payload.chunks} chunks, ${payload.bytes} bytes`;
-    return;
-  }
-
-  if (type === "audio.saved") {
-    addMessage("system", `Audio saved locally: ${payload.bytes} bytes\n${payload.path}`);
-    statusEl.textContent = "Audio saved";
-    return;
-  }
-
-  if (type === "stt.started") {
-    addMessage("system", `STT started: ${payload.command}`);
-    return;
-  }
-
-  if (type === "stt.final") {
-    addMessage("user", payload.text);
-    return;
-  }
-
-  if (type === "error") {
-    addMessage("system", `Error: ${payload.message}`);
-  }
-}
-
-form.addEventListener("submit", (event) => {
-  event.preventDefault();
-  const text = input.value.trim();
-  if (!text) return;
-
-  addMessage("user", text);
-  input.value = "";
-  sendJson("user.message", { text });
-});
-
-input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    form.requestSubmit();
-  }
-});
-
-micBtn.addEventListener("click", async () => {
-  if (recorder?.state === "recording") {
-    recorder.stop();
-    micBtn.classList.remove("recording");
-    micBtn.textContent = "Record";
-    return;
-  }
-
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    },
-    video: false
-  });
-
-  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : "audio/webm";
-
-  sendJson("audio.start", { mime_type: mimeType });
-
-  recorder = new MediaRecorder(micStream, { mimeType });
-  recorder.addEventListener("dataavailable", async (event) => {
-    if (event.data.size > 0 && ws?.readyState === WebSocket.OPEN) {
-      ws.send(await event.data.arrayBuffer());
+  ws.addEventListener("message", (message) => {
+    const event = JSON.parse(message.data);
+    if (event.type === "terminal.output") terminal.write(event.payload.data);
+    if (event.type === "terminal.exit") {
+      terminal.write(`\r\n\x1b[90m[OpenCode exited with code ${event.payload.exit_code}]\x1b[0m\r\n`);
+      connectionEl.textContent = "process exited";
+      connectionEl.className = "error";
+    }
+    if (event.type === "error") {
+      terminal.write(`\r\n\x1b[31mvoice-cli: ${event.payload.message}\x1b[0m\r\n`);
+      connectionEl.textContent = "error";
+      connectionEl.className = "error";
     }
   });
 
-  recorder.addEventListener("stop", () => {
-    sendJson("audio.stop");
-    for (const track of micStream?.getTracks() || []) track.stop();
-    micStream = null;
+  ws.addEventListener("close", () => {
+    connectionEl.textContent = "disconnected · reload to reconnect";
+    connectionEl.className = "error";
   });
+}
 
-  recorder.start(250);
-  micBtn.classList.add("recording");
-  micBtn.textContent = "Stop";
-});
+terminal.onData((data) => send("terminal.input", { data }));
+new ResizeObserver(() => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(fit, 40);
+}).observe(container);
 
 connect();
-

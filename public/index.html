@@ -3,28 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Local Agent Runtime</title>
+    <title>OpenCode · Voice CLI</title>
+    <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="app">
-      <header>
-        <div>
-          <h1>Local Agent Runtime</h1>
-          <p id="status">Connecting...</p>
-        </div>
-        <div class="transport">WebSocket</div>
-      </header>
-
-      <section class="messages" id="messages" aria-label="Messages"></section>
-
-      <form id="composer" class="composer">
-        <button id="micBtn" type="button">Record</button>
-        <textarea id="input" rows="2" placeholder="輸入文字，或按 Record 串流音訊到 agent runtime"></textarea>
-        <button type="submit">Send</button>
-      </form>
-    </main>
+    <main id="terminal" aria-label="OpenCode terminal"></main>
+    <div id="connection" role="status">connecting…</div>
     <script src="/app.js" type="module"></script>
   </body>
 </html>
-

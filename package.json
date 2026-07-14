@@ -1,14 +1,21 @@
 {
-  "name": "local-ws-agent-demo",
+  "name": "voice-cli",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "voice-cli": "./bin/voice-cli.mjs"
+  },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs"
+    "check": "node --check server.mjs && node --check bin/voice-cli.mjs && node --check public/app.js"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "node-pty": "^1.1.0"
   }
 }
-

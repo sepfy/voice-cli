@@ -3,14 +3,25 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import pty from "node-pty";
 
 const rootDir = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(rootDir, "public");
+const vendorFiles = new Map([
+  ["/vendor/xterm.mjs", join(rootDir, "node_modules/@xterm/xterm/lib/xterm.mjs")],
+  ["/vendor/addon-fit.mjs", join(rootDir, "node_modules/@xterm/addon-fit/lib/addon-fit.mjs")],
+  ["/vendor/xterm.css", join(rootDir, "node_modules/@xterm/xterm/css/xterm.css")]
+]);
 const recordingsDir = join(rootDir, "recordings");
 const port = Number(process.env.PORT || 8791);
 const sttCommand = process.env.STT_COMMAND || "";
+const projectDir = resolve(process.env.VOICE_PROJECT_DIR || process.cwd());
+const opencodeCommand = process.env.OPENCODE_COMMAND || "opencode";
+const opencodeModel = process.env.OPENCODE_MODEL || "";
+const opencodeAgent = process.env.OPENCODE_AGENT || "";
+const shouldOpenBrowser = process.env.VOICE_OPEN_BROWSER === "1";
 
 const sockets = new Set();
 const sessions = new Map();
@@ -24,7 +35,10 @@ function sessionFor(socket) {
   if (!session) {
     session = {
       id: crypto.randomUUID(),
-      audio: null
+      audio: null,
+      opencodeSessionId: null,
+      agentProcess: null,
+      terminal: null
     };
     sessions.set(socket, session);
   }
@@ -43,9 +57,9 @@ function broadcast(event) {
 async function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
-  const path = normalize(join(publicDir, pathname));
+  const path = vendorFiles.get(pathname) || normalize(join(publicDir, pathname));
 
-  if (!path.startsWith(publicDir)) {
+  if (!path.startsWith(publicDir) && !vendorFiles.has(pathname)) {
     respond(res, 403, { error: "Forbidden" });
     return;
   }
@@ -71,6 +85,7 @@ function contentType(path) {
     case ".css":
       return "text/css; charset=utf-8";
     case ".js":
+    case ".mjs":
       return "text/javascript; charset=utf-8";
     default:
       return "application/octet-stream";
@@ -83,6 +98,8 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       transport: "websocket",
       sttConfigured: Boolean(sttCommand),
+      projectDir,
+      opencodeCommand,
       clients: sockets.size
     });
     return;
@@ -125,9 +142,12 @@ server.on("upgrade", (req, socket) => {
     type: "runtime.ready",
     payload: {
       session_id: session.id,
-      stt_configured: Boolean(sttCommand)
+      stt_configured: Boolean(sttCommand),
+      project_dir: projectDir,
+      opencode_command: opencodeCommand
     }
   });
+  startTerminal(socket, session);
 
   let buffer = Buffer.alloc(0);
   socket.on("data", (chunk) => {
@@ -172,6 +192,18 @@ async function handleFrame(socket, frame) {
     return;
   }
 
+  if (message.type === "terminal.input") {
+    session.terminal?.write(message.payload?.data || "");
+    return;
+  }
+
+  if (message.type === "terminal.resize") {
+    const cols = Math.max(2, Math.min(500, Number(message.payload?.cols) || 80));
+    const rows = Math.max(1, Math.min(200, Number(message.payload?.rows) || 24));
+    session.terminal?.resize(cols, rows);
+    return;
+  }
+
   if (message.type === "audio.start") {
     await startAudio(socket, session, message.payload || {});
     return;
@@ -183,6 +215,34 @@ async function handleFrame(socket, frame) {
   }
 
   send(socket, { type: "error", payload: { message: `Unsupported type: ${message.type}` } });
+}
+
+function startTerminal(socket, session) {
+  try {
+    const args = [];
+    if (opencodeModel) args.push("--model", opencodeModel);
+    if (opencodeAgent) args.push("--agent", opencodeAgent);
+    const terminal = pty.spawn(opencodeCommand, args, {
+      name: "xterm-256color",
+      cols: 100,
+      rows: 30,
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        TERM: "xterm-256color",
+        COLORTERM: "truecolor",
+        TERM_PROGRAM: "voice-cli"
+      }
+    });
+    session.terminal = terminal;
+    terminal.onData((data) => send(socket, { type: "terminal.output", payload: { data } }));
+    terminal.onExit(({ exitCode, signal }) => {
+      session.terminal = null;
+      send(socket, { type: "terminal.exit", payload: { exit_code: exitCode, signal } });
+    });
+  } catch (error) {
+    send(socket, { type: "error", payload: { message: `Unable to start OpenCode terminal: ${error.message}` } });
+  }
 }
 
 async function startAudio(socket, session, payload) {
@@ -301,6 +361,11 @@ async function runAgentLoop(socket, session, text) {
     return;
   }
 
+  if (session.agentProcess) {
+    send(socket, { type: "error", payload: { message: "OpenCode is already handling a request." } });
+    return;
+  }
+
   send(socket, {
     type: "agent.started",
     payload: {
@@ -309,35 +374,96 @@ async function runAgentLoop(socket, session, text) {
     }
   });
 
-  const response = [
-    "Local agent runtime received:",
-    prompt,
-    "",
-    "This is the transport/agent-loop boundary. Replace runAgentLoop() with opencode, Codex, or your own tool runner."
-  ].join("\n");
+  const args = ["run", "--format", "json", "--dir", projectDir];
+  if (session.opencodeSessionId) args.push("--session", session.opencodeSessionId);
+  if (opencodeModel) args.push("--model", opencodeModel);
+  if (opencodeAgent) args.push("--agent", opencodeAgent);
+  args.push("--", prompt);
 
-  for (const chunk of chunkText(response, 42)) {
-    send(socket, { type: "agent.delta", payload: { text: chunk } });
-    await sleep(35);
+  try {
+    const response = await runOpencode(socket, session, args);
+    send(socket, { type: "agent.done", payload: { text: response } });
+  } catch (error) {
+    send(socket, { type: "error", payload: { message: error.message } });
+    send(socket, { type: "agent.done", payload: { text: "" } });
   }
-
-  send(socket, { type: "agent.done", payload: { text: response } });
 }
 
-function chunkText(text, size) {
-  const chunks = [];
-  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
-  return chunks;
-}
+function runOpencode(socket, session, args) {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(opencodeCommand, args, {
+      cwd: projectDir,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    session.agentProcess = child;
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+    let buffer = "";
+    let response = "";
+    let stderr = "";
+    let settled = false;
+
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      session.agentProcess = null;
+      if (error) reject(error);
+      else resolvePromise(response);
+    }
+
+    function handleLine(line) {
+      if (!line.trim()) return;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      if (event.sessionID) session.opencodeSessionId = event.sessionID;
+      if (event.type === "text" && typeof event.part?.text === "string") {
+        const delta = event.part.text;
+        response += delta;
+        send(socket, { type: "agent.delta", payload: { text: delta } });
+      }
+      if (event.type === "error") {
+        const detail = event.error?.data?.message || event.error?.message || event.error?.name;
+        if (detail) stderr += `${detail}\n`;
+      }
+    }
+
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) handleLine(line);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = `${stderr}${chunk.toString("utf8")}`.slice(-8000);
+    });
+    child.on("error", (error) => {
+      const message = error.code === "ENOENT"
+        ? `OpenCode executable not found: ${opencodeCommand}. Install OpenCode or pass --opencode <path>.`
+        : `Unable to start OpenCode: ${error.message}`;
+      finish(new Error(message));
+    });
+    child.on("exit", (code, signal) => {
+      if (buffer) handleLine(buffer);
+      if (code === 0) finish();
+      else {
+        const reason = stderr.trim() || (signal ? `terminated by ${signal}` : `exited with code ${code}`);
+        finish(new Error(`OpenCode failed: ${reason}`));
+      }
+    });
+  });
 }
 
 function cleanupSocket(socket) {
   sockets.delete(socket);
   const session = sessions.get(socket);
   if (session?.audio?.stream) session.audio.stream.destroy();
+  if (session?.agentProcess) session.agentProcess.kill("SIGTERM");
+  if (session?.terminal) session.terminal.kill();
   sessions.delete(socket);
 }
 
@@ -403,11 +529,27 @@ function decodeFrame(buffer) {
 }
 
 server.listen(port, "127.0.0.1", () => {
-  console.log(`Local WebSocket agent demo listening on http://127.0.0.1:${port}`);
+  const url = `http://127.0.0.1:${port}`;
+  console.log(`Voice CLI listening on ${url}`);
+  console.log(`Project: ${projectDir}`);
+  console.log(`OpenCode: ${opencodeCommand}`);
   console.log(`STT adapter: ${sttCommand || "(not configured)"}`);
+  if (shouldOpenBrowser) openBrowser(url);
 });
+
+function openBrowser(url) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  child.on("error", (error) => console.error(`Could not open browser: ${error.message}`));
+  child.unref();
+}
 
 process.on("SIGINT", () => {
   broadcast({ type: "runtime.stopping", payload: {} });
+  for (const [socket, session] of sessions) {
+    if (session.terminal) session.terminal.kill();
+    socket.end();
+  }
   server.close(() => process.exit(0));
 });
