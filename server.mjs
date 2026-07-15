@@ -8,41 +8,41 @@ import { createOpenAiVoice } from "./server/openai-voice.mjs";
 const voice = createOpenAiVoice(config);
 let sfu;
 sfu = await createRealtimeSfu(config, {
-  onSessionReady: (session, sendEvent) => startTerminal(session, config, sendEvent),
-  onDataMessage: (session, event, sendEvent) => {
-    if (event.type === "audio.recording.start") void startVoiceRecording(session, sendEvent);
-    else if (event.type === "audio.recording.stop") void stopVoiceRecording(session, sendEvent);
-    else handleTerminalEvent(session, event, config, sendEvent);
+  onWorkspaceCreated: (workspace, sendEvent) => startTerminal(workspace, config, sendEvent),
+  onDataMessage: (connection, event, sendEvent) => {
+    if (event.type === "audio.recording.start") void startVoiceRecording(connection, sendEvent);
+    else if (event.type === "audio.recording.stop") void stopVoiceRecording(connection, sendEvent);
+    else handleTerminalEvent(connection.workspace, event, config, sendEvent);
   },
-  onSessionClosed: stopTerminal
+  onWorkspaceClosed: stopTerminal
 });
 const server = createHttpServer(config, sfu, voice);
 
-async function startVoiceRecording(session, sendEvent) {
+async function startVoiceRecording(connection, sendEvent) {
   try {
-    if (!session.audioStartPromise) session.audioStartPromise = sfu.startAudioRecording(session.id);
-    await session.audioStartPromise;
-    sendEvent(session, { type: "audio.recording.started", payload: {} });
+    if (!connection.audioStartPromise) connection.audioStartPromise = sfu.startAudioRecording(connection.id);
+    await connection.audioStartPromise;
+    sendEvent(connection, { type: "audio.recording.started", payload: {} });
   } catch (error) {
-    session.audioStartPromise = null;
-    sendEvent(session, { type: "error", payload: { message: error.message } });
+    connection.audioStartPromise = null;
+    sendEvent(connection, { type: "error", payload: { message: error.message } });
   }
 }
 
-async function stopVoiceRecording(session, sendEvent) {
+async function stopVoiceRecording(connection, sendEvent) {
   let recording;
   try {
-    await session.audioStartPromise;
-    sendEvent(session, { type: "audio.transcribing", payload: {} });
-    recording = await sfu.stopAudioRecording(session.id);
+    await connection.audioStartPromise;
+    sendEvent(connection, { type: "audio.transcribing", payload: {} });
+    recording = await sfu.stopAudioRecording(connection.id);
     const text = await voice.transcribe(await readFile(recording.audioPath), "audio/webm");
     if (!text) throw new Error("No speech was detected.");
-    sfu.sendInput(session.id, { type: "user.message", payload: { text } });
-    sendEvent(session, { type: "audio.transcribed", payload: { text } });
+    sfu.sendInput(connection.id, { type: "user.message", payload: { text } });
+    sendEvent(connection, { type: "audio.transcribed", payload: { text } });
   } catch (error) {
-    sendEvent(session, { type: "error", payload: { message: error.message } });
+    sendEvent(connection, { type: "error", payload: { message: error.message } });
   } finally {
-    session.audioStartPromise = null;
+    connection.audioStartPromise = null;
     if (recording) await rm(recording.directory, { recursive: true, force: true });
   }
 }

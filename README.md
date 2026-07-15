@@ -30,6 +30,10 @@ voice-cli . --port 9000 --model provider/model
 voice-cli --help
 ```
 
+## Sessions
+
+One server port can host multiple persistent OpenCode PTY sessions over one browser WebRTC connection. Use the left sidebar to create, select, and close them. A session remains active when its browser connection closes and is removed only from the sidebar or when the server stops. Reopening a session replays its recent terminal output. The default limit is 8 sessions; set `VOICE_MAX_SESSIONS` and `VOICE_TERMINAL_BUFFER_BYTES` to adjust the session count and per-session replay buffer.
+
 For development, `npm start` still starts the server directly for the current directory.
 
 ## Requirements

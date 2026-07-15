@@ -8,6 +8,13 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <aside id="session-panel" aria-label="OpenCode sessions">
+      <div class="session-panel-header">
+        <span>SESSIONS</span>
+        <button id="new-session" type="button">+ New</button>
+      </div>
+      <div id="session-list"></div>
+    </aside>
     <main id="terminal" aria-label="OpenCode terminal"></main>
     <button id="voice" type="button" aria-label="Start voice input">Hold F8 to talk</button>
     <div id="connection" role="status">connecting…</div>

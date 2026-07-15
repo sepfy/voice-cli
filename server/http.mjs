@@ -15,7 +15,13 @@ export function createHttpServer(config, sfu, voice) {
       res.writeHead(204, { "Access-Control-Allow-Methods": "OPTIONS, POST, DELETE", "Access-Control-Allow-Headers": "Content-Type" });
       return res.end();
     }
-    if (req.method === "GET" && url.pathname === "/health") return respond(res, 200, { ok: true, transport: "whip-mediasoup-datachannel", voiceConfigured: voice.configured(), clients: sfu.clients(), audioTracks: sfu.audioTracks(), projectDir: config.projectDir, opencodeCommand: config.opencodeCommand });
+    if (req.method === "GET" && url.pathname === "/health") return respond(res, 200, { ok: true, transport: "whip-mediasoup-datachannel", voiceConfigured: voice.configured(), clients: sfu.clients(), sessions: sfu.listWorkspaces(), audioTracks: sfu.audioTracks(), projectDir: config.projectDir, opencodeCommand: config.opencodeCommand });
+    if (req.method === "GET" && url.pathname === "/sessions") return respond(res, 200, { sessions: sfu.listWorkspaces() });
+    if (req.method === "POST" && url.pathname === "/sessions") return createWorkspace(req, res, sfu);
+    if (req.method === "DELETE" && url.pathname.startsWith("/sessions/")) {
+      const deleted = sfu.closeWorkspace(url.pathname.slice("/sessions/".length));
+      return deleted ? respond(res, 200, { ok: true }) : respond(res, 404, { error: "Unknown workspace session." });
+    }
     if (req.method === "POST" && url.pathname === "/whip") return createWhipSession(req, res, sfu);
     if (req.method === "POST" && url.pathname === "/voice/speak") return speak(req, res, voice);
     if (req.method === "DELETE" && url.pathname.startsWith("/whip/session/")) {
@@ -25,6 +31,16 @@ export function createHttpServer(config, sfu, voice) {
     }
     await serveStatic(req, res, publicDir, vendorFiles);
   });
+}
+
+async function createWorkspace(req, res, sfu) {
+  try {
+    const body = await readBody(req, 10_000);
+    const payload = body.length ? JSON.parse(body.toString("utf8")) : {};
+    return respond(res, 201, { session: sfu.createWorkspace(payload.name) });
+  } catch (error) {
+    return respond(res, 400, { error: error.message || "Invalid session request." });
+  }
 }
 
 async function speak(req, res, voice) {
@@ -70,7 +86,7 @@ async function serveStatic(req, res, publicDir, vendorFiles) {
   if (!path.startsWith(publicDir) && !vendorFiles.has(pathname)) return respond(res, 403, { error: "Forbidden" });
   try {
     const body = await readFile(path);
-    res.writeHead(200, { "Content-Type": contentType(path) });
+    res.writeHead(200, { "Content-Type": contentType(path), "Cache-Control": "no-store" });
     res.end(body);
   } catch {
     respond(res, 404, { error: "Not found" });

@@ -5,7 +5,9 @@ import { startAudioBridge } from "./audio-bridge.mjs";
 const outboundTypes = new Set(["terminal.output", "terminal.exit", "runtime.ready", "agent.started", "agent.delta", "agent.done", "error", "audio.ready", "audio.recording.started", "audio.transcribing", "audio.transcribed"]);
 
 export async function createRealtimeSfu(config, handlers) {
-  const sessions = new Map();
+  const connections = new Map();
+  const workspaces = new Map();
+  let workspaceSequence = 0;
   const worker = await mediasoup.createWorker({ logLevel: "warn" });
   const router = await worker.createRouter({
     mediaCodecs: [{ kind: "audio", mimeType: "audio/opus", clockRate: 48000, channels: 2, preferredPayloadType: 111, parameters: { useinbandfec: 1 } }]
@@ -16,10 +18,30 @@ export async function createRealtimeSfu(config, handlers) {
     process.exit(1);
   });
 
-  function sendEvent(session, event) {
-    if (session.dataProducer && !session.dataProducer.closed) {
-      session.dataProducer.send(JSON.stringify({ ...event, at: new Date().toISOString() }));
+  function sendEvent(connection, event) {
+    if (connection.dataProducer && !connection.dataProducer.closed) {
+      connection.dataProducer.send(JSON.stringify({ ...event, at: new Date().toISOString() }));
     }
+  }
+
+  function broadcast(workspace, event) {
+    if (event.type === "terminal.output") {
+      workspace.output = `${workspace.output}${event.payload.data}`.slice(-config.terminalOutputBufferBytes);
+    }
+    for (const connection of workspace.connections) sendEvent(connection, { ...event, sessionId: workspace.id });
+  }
+
+  function workspaceSummary(workspace) {
+    return { id: workspace.id, name: workspace.name, createdAt: workspace.createdAt, connected: workspace.connections.size, running: Boolean(workspace.terminal) };
+  }
+
+  function createWorkspace(name) {
+    if (workspaces.size >= config.maxSessions) throw new Error(`Session limit reached (${config.maxSessions}). Close an existing session first.`);
+    workspaceSequence += 1;
+    const workspace = { id: crypto.randomUUID(), name: typeof name === "string" && name.trim() ? name.trim().slice(0, 80) : `Session ${workspaceSequence}`, createdAt: new Date().toISOString(), connections: new Set(), output: "", started: false, terminal: null, pendingInput: [], agentProcess: null, opencodeSessionId: null };
+    workspaces.set(workspace.id, workspace);
+    handlers.onWorkspaceCreated(workspace, (_workspace, event) => broadcast(workspace, event));
+    return workspaceSummary(workspace);
   }
 
   async function createSession(offer) {
@@ -27,39 +49,57 @@ export async function createRealtimeSfu(config, handlers) {
     const id = crypto.randomUUID();
     const transport = await createTransport(router, config);
     await transport.connect({ dtlsParameters: { role: "client", fingerprints: [{ algorithm: remote.fingerprint.algorithm, value: remote.fingerprint.value }] } });
-    const session = { id, transport, dataProducer: null, dataConsumer: null, browserDataConsumer: null, terminal: null, pendingInput: [], agentProcess: null, opencodeSessionId: null };
-    sessions.set(id, session);
+    const connection = { id, workspace: null, transport, dataProducer: null, dataConsumer: null, browserDataConsumer: null };
+    connections.set(id, connection);
     transport.on("close", () => cleanupSession(id));
     transport.on("icestatechange", (state) => {
       if (state === "disconnected" || state === "closed") cleanupSession(id);
     });
     transport.on("sctpstatechange", (state) => {
-      if (state === "connected") initializeDataChannel(session);
+      if (state === "connected") initializeDataChannel(connection);
     });
     return { location: `/whip/session/${id}`, answer: createWhipAnswer(transport, remote) };
   }
 
-  async function initializeDataChannel(session) {
-    if (session.dataProducer || session.transport.closed) return;
+  async function initializeDataChannel(connection) {
+    if (connection.dataProducer || connection.transport.closed) return;
     try {
-      session.dataProducer = await session.transport.produceData({ sctpStreamParameters: { streamId: 0, ordered: true }, label: "agent-control", protocol: "json" });
-      session.dataConsumer = await agentTransport.consumeData({ dataProducerId: session.dataProducer.id });
-      session.browserDataConsumer = await session.transport.consumeData({ dataProducerId: session.dataProducer.id });
-      session.dataConsumer.on("message", (message) => handleDataMessage(session, message));
-      handlers.onSessionReady(session, sendEvent);
+      connection.dataProducer = await connection.transport.produceData({ sctpStreamParameters: { streamId: 0, ordered: true }, label: "agent-control", protocol: "json" });
+      connection.dataConsumer = await agentTransport.consumeData({ dataProducerId: connection.dataProducer.id });
+      connection.browserDataConsumer = await connection.transport.consumeData({ dataProducerId: connection.dataProducer.id });
+      connection.dataConsumer.on("message", (message) => handleDataMessage(connection, message));
+      handlers.onConnectionReady?.(connection, sendEvent);
     } catch (error) {
       console.error(`Unable to initialize DataChannel: ${error.message}`);
-      cleanupSession(session.id);
+      cleanupSession(connection.id);
     }
   }
 
-  function handleDataMessage(session, message) {
+  function handleDataMessage(connection, message) {
     let event;
     try { event = JSON.parse(Buffer.from(message).toString("utf8")); } catch {
-      return sendEvent(session, { type: "error", payload: { message: "Invalid DataChannel JSON." } });
+      return sendEvent(connection, { type: "error", payload: { message: "Invalid DataChannel JSON." } });
     }
-    if (event.type === "audio.produce") return produceAudio(session, event.payload, sendEvent);
-    if (!outboundTypes.has(event.type)) handlers.onDataMessage(session, event, sendEvent);
+    if (event.type === "audio.produce") return produceAudio(connection, event.payload, sendEvent);
+    if (event.type === "session.select") return selectWorkspace(connection, event.payload?.sessionId);
+    if (event.type === "terminal.sync") {
+      if (connection.workspace?.output) sendEvent(connection, { type: "terminal.output", sessionId: connection.workspace.id, payload: { data: connection.workspace.output } });
+      return;
+    }
+    // xterm can emit an initial resize before the ordered selection control arrives.
+    if (!connection.workspace) return;
+    if (!outboundTypes.has(event.type)) handlers.onDataMessage(connection, event, sendEvent);
+  }
+
+  function selectWorkspace(connection, workspaceId) {
+    const workspace = workspaces.get(workspaceId);
+    if (!workspace) return sendEvent(connection, { type: "error", payload: { message: "Unknown workspace session." } });
+    connection.workspace?.connections.delete(connection);
+    connection.workspace = workspace;
+    workspace.connections.add(connection);
+    sendEvent(connection, { type: "session.selected", sessionId: workspace.id, payload: workspaceSummary(workspace) });
+    if (workspace.output) sendEvent(connection, { type: "terminal.output", sessionId: workspace.id, payload: { data: workspace.output } });
+    sendEvent(connection, { type: "runtime.ready", sessionId: workspace.id, payload: { session_id: workspace.id, project_dir: config.projectDir } });
   }
 
   async function produceAudio(session, payload, sendEvent) {
@@ -74,43 +114,60 @@ export async function createRealtimeSfu(config, handlers) {
   }
 
   function cleanupSession(id) {
-    const session = sessions.get(id);
-    if (!session) return;
-    sessions.delete(id);
-    handlers.onSessionClosed(session);
-    session.dataConsumer?.close();
-    session.dataProducer?.close();
-    session.browserDataConsumer?.close();
-    session.audioProducer?.close();
-    session.audioRecording?.abort();
-    session.transport.close();
+    const connection = connections.get(id);
+    if (!connection) return;
+    connections.delete(id);
+    connection.workspace?.connections.delete(connection);
+    handlers.onSessionClosed?.(connection);
+    connection.dataConsumer?.close();
+    connection.dataProducer?.close();
+    connection.browserDataConsumer?.close();
+    connection.audioProducer?.close();
+    connection.audioRecording?.abort();
+    connection.transport.close();
+  }
+
+  function closeWorkspace(id) {
+    const workspace = workspaces.get(id);
+    if (!workspace) return false;
+    workspaces.delete(id);
+    for (const connection of [...workspace.connections]) {
+      workspace.connections.delete(connection);
+      connection.workspace = null;
+      sendEvent(connection, { type: "session.closed", sessionId: id, payload: {} });
+    }
+    handlers.onWorkspaceClosed(workspace);
+    return true;
   }
 
   return {
-    clients: () => sessions.size,
-    audioTracks: () => [...sessions.values()].filter((session) => session.audioProducer && !session.audioProducer.closed).length,
+    clients: () => connections.size,
+    audioTracks: () => [...connections.values()].filter((connection) => connection.audioProducer && !connection.audioProducer.closed).length,
+    createWorkspace,
+    listWorkspaces: () => [...workspaces.values()].map(workspaceSummary),
+    closeWorkspace,
     createSession,
     sendInput: (sessionId, event) => {
-      const session = sessions.get(sessionId);
-      if (!session) throw new Error("Voice session is no longer connected.");
-      handlers.onDataMessage(session, event, sendEvent);
+      const connection = connections.get(sessionId);
+      if (!connection) throw new Error("Voice session is no longer connected.");
+      handlers.onDataMessage(connection, event, sendEvent);
     },
     async startAudioRecording(sessionId) {
-      const session = sessions.get(sessionId);
-      if (!session?.audioProducer) throw new Error("Microphone audio track is not ready.");
-      if (session.audioRecording) return;
-      session.audioRecording = await startAudioBridge(router, session.audioProducer, config);
+      const connection = connections.get(sessionId);
+      if (!connection?.audioProducer) throw new Error("Microphone audio track is not ready.");
+      if (connection.audioRecording) return;
+      connection.audioRecording = await startAudioBridge(router, connection.audioProducer, config);
     },
     async stopAudioRecording(sessionId) {
-      const session = sessions.get(sessionId);
-      if (!session?.audioRecording) throw new Error("No active voice recording.");
-      const recording = session.audioRecording;
-      session.audioRecording = null;
+      const connection = connections.get(sessionId);
+      if (!connection?.audioRecording) throw new Error("No active voice recording.");
+      const recording = connection.audioRecording;
+      connection.audioRecording = null;
       return recording.stop();
     },
     closeSession: cleanupSession,
     close: () => {
-      for (const id of [...sessions.keys()]) cleanupSession(id);
+      for (const id of [...workspaces.keys()]) closeWorkspace(id);
       worker.close();
     }
   };
